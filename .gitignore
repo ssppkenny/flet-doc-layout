@@ -1,0 +1,17 @@
+# build output
+build/
+
+# pixi cache / envs
+.pixi/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# backup files
+*.bak
+
+# large model file — use git-lfs or store separately
+src/assets/doclayout.onnx

@@ -1,0 +1,31 @@
+[project]
+name = "doc-layout"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "flet",
+    "pillow",
+    "python-djvulibre",
+    "flet-libdjvulibre",
+    "flet-libcpp-shared",
+    "flet-libjpeg",
+    "numpy",
+    "opencv-python",
+    "certifi",
+]
+
+[tool.flet.app]
+path = "src"
+
+[tool.flet.android]
+min_sdk_version = 24
+
+[tool.flet.android.permission]
+"android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.READ_MEDIA_IMAGES" = true
+
+[tool.flet.dev_packages]
+python-djvulibre = "../mobile-forge/dist/python_djvulibre-0.8.8-cp312-cp312-android_24_arm64_v8a.whl"
+flet-libdjvulibre = "../mobile-forge/dist/flet_libdjvulibre-3.5.29-0-py3-none-android_24_arm64_v8a.whl"
+flet-libcpp-shared = "../mobile-forge/dist/flet_libcpp_shared-27.3.13750724-0-py3-none-android_24_arm64_v8a.whl"
+flet-libjpeg = "../mobile-forge/dist/flet_libjpeg-3.0.90-1-py3-none-android_24_arm64_v8a.whl"
