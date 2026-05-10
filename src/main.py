@@ -1,5 +1,5 @@
 """
-doc-layout: DjVu/PDF viewer with word-level reflow.
+Flow Reader: DjVu/PDF viewer with word-level reflow.
 """
 
 from __future__ import annotations
@@ -780,7 +780,7 @@ async def main(page: ft.Page):
     )
 
     # ---- download UI ----
-    dl_title    = ft.Text("doc-layout", size=24, weight=ft.FontWeight.BOLD)
+    dl_title    = ft.Text("Flow Reader", size=24, weight=ft.FontWeight.BOLD)
     dl_label    = ft.Text("Preparing…")
     dl_bar      = ft.ProgressBar(value=0, width=300)
     dl_bytes    = ft.Text("")

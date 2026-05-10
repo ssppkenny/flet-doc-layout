@@ -1,5 +1,5 @@
 [project]
-name = "doc-layout"
+name = "flow-reader"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,15 +16,20 @@ dependencies = [
     "flet-libpdfium",
 ]
 
+[tool.flet]
+product = "Flow Reader"
+
 [tool.flet.app]
 path = "src"
 
 [tool.flet.android]
+bundle_id = "com.veve.flowreader"
 min_sdk_version = 24
 
 [tool.flet.android.permission]
 "android.permission.READ_EXTERNAL_STORAGE" = true
 "android.permission.READ_MEDIA_IMAGES" = true
+"android.permission.INTERNET" = true
 
 [tool.flet.dev_packages]
 python-djvulibre = "../mobile-forge/dist/python_djvulibre-0.8.8-cp312-cp312-android_24_arm64_v8a.whl"
