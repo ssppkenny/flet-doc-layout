@@ -9,6 +9,7 @@ import io
 import os
 import traceback
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -295,9 +296,131 @@ def _do_reflow(
         return crop
 
     # ------------------------------------------------------------------
-    # Main sequential pass (titled_block_title is stateful)
+    # Phase 1: build ordered work units (sequential — resolves gaps and
+    # titled_block_title buffering which require positional context).
+    # Each unit is a callable() -> (strip, gap_before, gap_after) | None.
+    # titled pairs are kept as a single callable (sequential internally).
     # ------------------------------------------------------------------
-    # Allocate a tall canvas; we'll crop at the end
+    _LINE_H_PX = 25  # original-space pixels
+    _max_nontext_gap = max(min_gap, int(_LINE_H_PX * zoom_factor * 2))
+
+    def _last_placed_label(idx: int) -> Optional[str]:
+        """Return label of last detection that was actually placed (skip titled_block_title / abandon)."""
+        for i in range(idx - 1, -1, -1):
+            if all_dets[i].label not in ("titled_block_title", "abandon"):
+                return all_dets[i].label
+        return None
+
+    # work_units: list of callables, each returns (strip, gap_before, gap_after) | None
+    work_units = []
+
+    pending_title_det = None
+    pending_title_gap = 0
+
+    for idx, det in enumerate(all_dets):
+        prev_y2 = all_dets[idx - 1].y2 if idx > 0 else 0
+        next_y1 = all_dets[idx + 1].y1 if idx < len(all_dets) - 1 else page_h
+        gap_before = max(min_gap, int((det.y1 - prev_y2) * zoom_factor))
+        gap_after  = max(min_gap, int((next_y1 - det.y2) * zoom_factor))
+
+        label = det.label
+
+        if label in _TEXT_CLASSES:
+            last_placed = _last_placed_label(idx)
+            if last_placed in _NON_TEXT_LABELS:
+                gap_before = min(gap_before, _max_nontext_gap)
+
+        if label == "abandon":
+            continue
+
+        if label == "titled_block_title":
+            last_placed = _last_placed_label(idx)
+            if last_placed in _NON_TEXT_LABELS:
+                gap_before = min(gap_before, _max_nontext_gap)
+            pending_title_det = det
+            pending_title_gap = gap_before
+            continue
+
+        is_text = label in _TEXT_CLASSES
+        block_w = det.x2 - det.x1
+        is_narrow = (
+            label in ("plain text", "titled_block_body")
+            and block_w < median_plain_w * 0.65
+        )
+
+        if not is_text or is_narrow:
+            _det = det
+            _gap_before = gap_before
+            _gap_after = gap_after
+            _ptd = pending_title_det
+            _ptg = pending_title_gap
+            pending_title_det = None
+            pending_title_gap = 0
+
+            def _make_nontext_unit(_d, _gb, _ga, _ptd, _ptg):
+                def _run():
+                    crop = img_bgr[_d.y1:_d.y2, _d.x1:_d.x2].copy()
+                    actual_gap = _gb
+                    if _d.label == "titled_block_body" and _ptd is not None:
+                        title_img = img_bgr[_ptd.y1:_ptd.y2, _ptd.x1:_ptd.x2].copy()
+                        t_h, t_w = title_img.shape[:2]
+                        b_h, b_w = crop.shape[:2]
+                        combined_w = max(t_w, b_w)
+                        canvas_t = np.empty((t_h, combined_w, 3), dtype=np.uint8)
+                        canvas_t[:] = bg
+                        canvas_t[:, :t_w] = title_img
+                        canvas_b = np.empty((b_h, combined_w, 3), dtype=np.uint8)
+                        canvas_b[:] = bg
+                        canvas_b[:, :b_w] = crop
+                        crop = np.vstack([canvas_t, canvas_b])
+                        actual_gap = _ptg
+                    if crop.size == 0:
+                        return None
+                    return _zoom_crop(crop), actual_gap, _ga
+                return _run
+
+            work_units.append(_make_nontext_unit(_det, _gap_before, _gap_after, _ptd, _ptg))
+            continue
+
+        # ---- text block (not narrow) ----
+        # titled_block_body (not narrow): emit pending title first as its own unit
+        if label == "titled_block_body" and pending_title_det is not None:
+            _ptd = pending_title_det
+            _ptg = pending_title_gap
+            _body_gap = max(min_gap, int((det.y1 - all_dets[idx - 1].y2) * zoom_factor))
+            pending_title_det = None
+            pending_title_gap = 0
+
+            def _make_title_unit(_ptd, _ptg, _bga):
+                def _run():
+                    title_img = img_bgr[_ptd.y1:_ptd.y2, _ptd.x1:_ptd.x2].copy()
+                    return _zoom_crop(title_img), _ptg, _bga
+                return _run
+
+            work_units.append(_make_title_unit(_ptd, _ptg, _body_gap))
+            gap_before = _body_gap
+        else:
+            pending_title_det = None
+            pending_title_gap = 0
+
+        _det = det
+        _gap_before = gap_before
+        _gap_after = gap_after
+
+        def _make_text_unit(_d, _gb, _ga):
+            def _run():
+                crop = _masked_crop(_d)
+                strip = _reflow_text(_d, crop)
+                if strip is None:
+                    return None
+                return strip, _gb, _ga
+            return _run
+
+        work_units.append(_make_text_unit(_det, _gap_before, _gap_after))
+
+    # ------------------------------------------------------------------
+    # Phase 2: execute work units in parallel, assemble canvas in order
+    # ------------------------------------------------------------------
     canvas_h = max(int(page_h * zoom_factor * 2), 2000)
     canvas = np.empty((canvas_h, new_page_width, 3), dtype=np.uint8)
     canvas[:] = bg
@@ -321,103 +444,19 @@ def _do_reflow(
         canvas[current_y:current_y + sh] = strip
         current_y += sh
 
-    # Single line height estimate at 150dpi (12pt body text ≈ 25px).
-    # Used to cap the gap after non-text blocks (figure/table/formula → text).
-    _LINE_H_PX = 25  # original-space pixels
-    _max_nontext_gap = max(min_gap, int(_LINE_H_PX * zoom_factor * 2))
-
-    def _last_placed_label(idx: int) -> Optional[str]:
-        """Return label of last detection that was actually placed (skip titled_block_title / abandon)."""
-        for i in range(idx - 1, -1, -1):
-            if all_dets[i].label not in ("titled_block_title", "abandon"):
-                return all_dets[i].label
-        return None
-
-    pending_title_img: Optional[np.ndarray] = None
-    pending_title_gap: int = 0
-
-    for idx, det in enumerate(all_dets):
-        prev_y2 = all_dets[idx - 1].y2 if idx > 0 else 0
-        next_y1 = all_dets[idx + 1].y1 if idx < len(all_dets) - 1 else page_h
-        gap_before = max(min_gap, int((det.y1 - prev_y2) * zoom_factor))
-        gap_after  = max(min_gap, int((next_y1 - det.y2) * zoom_factor))
-
-        label = det.label
-
-        # Cap gap_before when transitioning from a non-text block to a text block
-        # (direct: figure→text, or indirect: figure→titled_block_title→titled_block_body)
-        if label in _TEXT_CLASSES:
-            last_placed = _last_placed_label(idx)
-            if last_placed in _NON_TEXT_LABELS:
-                gap_before = min(gap_before, _max_nontext_gap)
-
-        # Skip noise
-        if label == "abandon":
-            continue
-
-        # ---- titled_block_title: buffer and skip ----
-        if label == "titled_block_title":
-            pending_title_img = img_bgr[det.y1:det.y2, det.x1:det.x2].copy()
-            # Also cap the buffered gap using the same rule
-            last_placed = _last_placed_label(idx)
-            if last_placed in _NON_TEXT_LABELS:
-                gap_before = min(gap_before, _max_nontext_gap)
-            pending_title_gap = gap_before
-            continue
-
-        # ---- non-text blocks (and titled_block_body narrow path) ----
-        is_text = label in _TEXT_CLASSES
-        block_w = det.x2 - det.x1
-        is_narrow = (
-            label in ("plain text", "titled_block_body")
-            and block_w < median_plain_w * 0.65
-        )
-
-        if not is_text or is_narrow:
-            crop = img_bgr[det.y1:det.y2, det.x1:det.x2].copy()
-
-            if label == "titled_block_body" and pending_title_img is not None:
-                # Stack title on top of body, zoom as one image
-                t_h, t_w = pending_title_img.shape[:2]
-                b_h, b_w = crop.shape[:2]
-                combined_w = max(t_w, b_w)
-                canvas_t = np.empty((t_h, combined_w, 3), dtype=np.uint8)
-                canvas_t[:] = bg
-                canvas_t[:, :t_w] = pending_title_img
-                canvas_b = np.empty((b_h, combined_w, 3), dtype=np.uint8)
-                canvas_b[:] = bg
-                canvas_b[:, :b_w] = crop
-                crop = np.vstack([canvas_t, canvas_b])
-                gap_before = pending_title_gap
-                pending_title_img = None
-                pending_title_gap = 0
-
-            if crop.size == 0:
+    last_gap_after = min_gap
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(fn) for fn in work_units]
+        for fut in futures:
+            result = fut.result()  # preserves submission order
+            if result is None:
                 continue
-
-            strip = _zoom_crop(crop)
+            strip, gap_before, gap_after = result
             _place(strip, gap_before)
-            continue
-
-        # ---- text block (not narrow) ----
-
-        # titled_block_body (not narrow): first emit pending title as zoomed crop
-        if label == "titled_block_body" and pending_title_img is not None:
-            title_strip = _zoom_crop(pending_title_img)
-            _place(title_strip, pending_title_gap)
-            # gap between title strip and body is the original title→body gap
-            gap_before = max(min_gap, int((det.y1 - all_dets[idx - 1].y2) * zoom_factor))
-            pending_title_img = None
-            pending_title_gap = 0
-
-        crop = _masked_crop(det)
-        strip = _reflow_text(det, crop)
-        if strip is None:
-            continue
-        _place(strip, gap_before)
+            last_gap_after = gap_after
 
     # Crop canvas to actual content (add bottom margin from last block to page bottom)
-    current_y += gap_after  # gap_after of last processed block
+    current_y += last_gap_after
     final_h = max(1, current_y)
     result_bgr = canvas[:final_h]
     result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
