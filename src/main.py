@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import traceback
+import urllib.request
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -20,9 +22,33 @@ import doctr_inference
 import line_grouping
 import reflow_words
 
-ASSETS_DIR = Path(__file__).parent / "assets"
-ONNX_PATH       = ASSETS_DIR / "doclayout.onnx"
-DOCTR_ONNX_PATH = ASSETS_DIR / "fast_base.onnx"
+# ---------------------------------------------------------------------------
+# Model download configuration
+# ---------------------------------------------------------------------------
+_RELEASE_BASE = (
+    "https://github.com/ssppkenny/flet-doc-layout/releases/download/models"
+)
+MODEL_URLS = {
+    "doclayout.onnx": (f"{_RELEASE_BASE}/doclayout.onnx", 75512430),
+    "fast_base.onnx": (f"{_RELEASE_BASE}/fast_base.onnx", 65436251),
+}
+
+
+def _models_dir() -> Path:
+    storage = os.environ.get("FLET_APP_STORAGE_DATA")
+    if storage:
+        return Path(storage) / "models"
+    # fallback for local dev runs
+    return Path(__file__).parent / "assets" / "models"
+
+
+def _models_ok() -> bool:
+    d = _models_dir()
+    for name, (_, expected_size) in MODEL_URLS.items():
+        f = d / name
+        if not f.exists() or f.stat().st_size != expected_size:
+            return False
+    return True
 
 _TEXT_CLASSES    = {"plain text", "title", "titled_block_body"}
 _NON_TEXT_LABELS = {
@@ -528,13 +554,16 @@ async def main(page: ft.Page):
     async def load_model_bg():
         await asyncio.sleep(0)
         try:
+            models_d = _models_dir()
+            onnx_path = models_d / "doclayout.onnx"
+            doctr_path = models_d / "fast_base.onnx"
             loop = asyncio.get_event_loop()
             state["net"] = await loop.run_in_executor(
-                None, lambda: inference.load_model(str(ONNX_PATH))
+                None, lambda: inference.load_model(str(onnx_path))
             )
             set_status("Layout model ready. Loading word model…")
             state["doctr_net"] = await loop.run_in_executor(
-                None, lambda: doctr_inference.load_model(str(DOCTR_ONNX_PATH))
+                None, lambda: doctr_inference.load_model(str(doctr_path))
             )
             set_status("Models ready. Open a DjVu or PDF file.")
             if state["page_image"] is not None:
@@ -732,26 +761,109 @@ async def main(page: ft.Page):
         await load_page(0)
 
     # ---- layout ----
-    page.add(
-        ft.Column(
-            scroll=ft.ScrollMode.ALWAYS,
-            expand=True,
-            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-            controls=[
-                ft.Row([btn_open, btn_prev, page_label, btn_next], spacing=8),
-                img_container,
-                ft.Row(
-                    [btn_reflow, btn_zoom, dd_lang],
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=12,
-                ),
-                status_text,
-            ],
-            spacing=8,
-        )
+    # ---- normal UI layout ----
+    normal_ui = ft.Column(
+        scroll=ft.ScrollMode.ALWAYS,
+        expand=True,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        controls=[
+            ft.Row([btn_open, btn_prev, page_label, btn_next], spacing=8),
+            img_container,
+            ft.Row(
+                [btn_reflow, btn_zoom, dd_lang],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=12,
+            ),
+            status_text,
+        ],
+        spacing=8,
     )
 
-    asyncio.ensure_future(load_model_bg())
+    # ---- download UI ----
+    dl_title    = ft.Text("doc-layout", size=24, weight=ft.FontWeight.BOLD)
+    dl_label    = ft.Text("Preparing…")
+    dl_bar      = ft.ProgressBar(value=0, width=300)
+    dl_bytes    = ft.Text("")
+    dl_error    = ft.Text("", color="red")
+    dl_retry    = ft.ElevatedButton("Retry", visible=False)
+
+    download_ui = ft.Column(
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[dl_title, dl_label, dl_bar, dl_bytes, dl_error, dl_retry],
+        spacing=16,
+    )
+
+    async def do_download():
+        dl_error.value = ""
+        dl_retry.visible = False
+        models_d = _models_dir()
+        models_d.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_event_loop()
+
+        for name, (url, expected_size) in MODEL_URLS.items():
+            dest = models_d / name
+            mb = expected_size / 1024 / 1024
+            dl_label.value = f"Downloading {name} ({mb:.0f} MB)…"
+            dl_bar.value = 0
+            dl_bytes.value = f"0 / {mb:.0f} MB"
+            page.update()
+
+            def _download(url=url, dest=dest, expected_size=expected_size,
+                          name=name, mb=mb):
+                req = urllib.request.urlopen(url, timeout=60)
+                received = 0
+                chunk = 65536
+                with open(dest, "wb") as f:
+                    while True:
+                        data = req.read(chunk)
+                        if not data:
+                            break
+                        f.write(data)
+                        received += len(data)
+                        # post progress back to event loop
+                        asyncio.run_coroutine_threadsafe(
+                            _update_progress(received, expected_size, mb),
+                            loop,
+                        )
+                if dest.stat().st_size != expected_size:
+                    dest.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"{name}: size mismatch "
+                        f"(got {dest.stat().st_size if dest.exists() else 0}, "
+                        f"expected {expected_size})"
+                    )
+
+            try:
+                await loop.run_in_executor(None, _download)
+            except Exception as e:
+                dl_error.value = f"Download failed: {e}"
+                dl_retry.visible = True
+                page.update()
+                return
+
+        # All downloaded — switch to normal UI
+        page.controls.clear()
+        page.add(normal_ui)
+        page.update()
+        asyncio.ensure_future(load_model_bg())
+
+    async def _update_progress(received: int, total: int, mb: float):
+        dl_bar.value = received / total
+        dl_bytes.value = f"{received/1024/1024:.1f} / {mb:.0f} MB"
+        page.update()
+
+    async def on_retry(_):
+        asyncio.ensure_future(do_download())
+
+    dl_retry.on_click = on_retry
+
+    # ---- startup ----
+    if _models_ok():
+        page.add(normal_ui)
+        asyncio.ensure_future(load_model_bg())
+    else:
+        page.add(download_ui)
+        asyncio.ensure_future(do_download())
 
 
 if __name__ == "__main__":
