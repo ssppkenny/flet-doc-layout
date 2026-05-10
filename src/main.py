@@ -5,7 +5,6 @@ doc-layout: DjVu/PDF viewer with word-level reflow.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import io
 import traceback
 from pathlib import Path
@@ -25,7 +24,12 @@ ASSETS_DIR = Path(__file__).parent / "assets"
 ONNX_PATH       = ASSETS_DIR / "doclayout.onnx"
 DOCTR_ONNX_PATH = ASSETS_DIR / "fast_base.onnx"
 
-_TEXT_CLASSES = {"plain text", "title"}
+_TEXT_CLASSES    = {"plain text", "title", "titled_block_body"}
+_NON_TEXT_LABELS = {
+    "figure", "figure_and_caption", "figure_caption",
+    "table", "table_and_caption", "table_caption", "table_footnote",
+    "isolate_formula", "isolate_formula_and_caption", "formula_caption",
+}
 ZOOM_STEPS = [2.0, 1.5, 1.0]
 
 LANGUAGES = [
@@ -114,54 +118,82 @@ def _do_reflow(
     """
     Per-region reflow. Runs in a thread executor (no Flet state access).
 
-    - Narrow plain-text blocks (< 65% of median width) → zoomed crop (preserves
-      verse / quote line structure).
-    - Title blocks → word reflow with is_title=True.
-    - Normal plain-text blocks → group words into lines → word reflow.
+    Text blocks (plain text / title / titled_block_body):
+      - Narrow (< 65% of median plain-text width) → proportionally scaled crop.
+      - Normal → word reflow.
+      - Before word detection, non-text regions that overlap are masked with bg.
 
-    Regions are processed in parallel then assembled top-to-bottom.
+    Non-text blocks (figure, table, formula, …):
+      - Zoomed crop, scaled down if wider than available width, centered.
+
+    titled_block_title:
+      - Buffered until the matching titled_block_body arrives.
+      - If body is narrow → stack title+body as one zoomed crop.
+      - If body is not narrow → emit title as zoomed crop, then reflow body.
+
+    Gaps between blocks are proportional to the original page spacing × zoom_factor.
     """
     img_np = np.array(page_img.convert("RGB"))
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    page_h, page_w = img_bgr.shape[:2]
 
     # Background colour: median pixel of the full page
     bg = tuple(int(x) for x in np.median(img_bgr.reshape(-1, 3), axis=0))
 
-    # Sort text regions top-to-bottom
-    text_dets = sorted(
-        [d for d in dets if d.label in _TEXT_CLASSES],
-        key=lambda d: d.y1,
-    )
-    if not text_dets:
+    # Sort all detections top-to-bottom
+    all_dets = sorted(dets, key=lambda d: d.y1)
+
+    if not all_dets:
         h = int(page_img.size[1] * zoom_factor)
         blank = np.ones((h, new_page_width, 3), dtype=np.uint8)
         blank[:] = bg
         return Image.fromarray(blank)
 
-    # Median width of plain-text regions (for narrow-block detection)
-    plain_widths = [d.x2 - d.x1 for d in text_dets if d.label == "plain text"]
-    median_plain_w = float(np.median(plain_widths)) if plain_widths else page_img.size[0]
+    # Median width of reflowable plain-text regions (for narrow-block detection)
+    plain_widths = [
+        d.x2 - d.x1 for d in all_dets
+        if d.label in ("plain text", "titled_block_body")
+    ]
+    median_plain_w = float(np.median(plain_widths)) if plain_widths else page_w
 
-    def process_region(det) -> Optional[np.ndarray]:
-        region_w = det.x2 - det.x1
-        is_narrow = (det.label == "plain text" and region_w < median_plain_w * 0.65)
-        box_img = img_bgr[det.y1:det.y2, det.x1:det.x2]
+    left_margin  = max(10, int(20 * zoom_factor / 2))
+    right_margin = left_margin
+    available_w  = new_page_width - left_margin - right_margin
+    min_gap      = 4
 
+    # ------------------------------------------------------------------
+    # Helper: zoom a BGR crop to fit available_w, return (h, w, strip)
+    # ------------------------------------------------------------------
+    def _zoom_crop(crop: np.ndarray) -> np.ndarray:
+        ch, cw = crop.shape[:2]
+        zh = int(ch * zoom_factor)
+        zw = int(cw * zoom_factor)
+        if zw > available_w:
+            scale = available_w / zw
+            zw = available_w
+            zh = max(1, int(zh * scale))
+        zh = max(1, zh)
+        zw = max(1, zw)
+        resized = cv2.resize(crop, (zw, zh), interpolation=cv2.INTER_LINEAR)
+        strip = np.empty((zh, new_page_width, 3), dtype=np.uint8)
+        strip[:] = bg
+        x_off = left_margin + (available_w - zw) // 2
+        x_off = max(0, min(x_off, new_page_width - zw))
+        strip[:, x_off:x_off + zw] = resized
+        return strip
+
+    # ------------------------------------------------------------------
+    # Helper: reflow one text detection, return strip or None
+    # ------------------------------------------------------------------
+    def _reflow_text(det, box_img: np.ndarray) -> Optional[np.ndarray]:
+        """box_img is already masked (non-text regions filled with bg)."""
         if box_img.size == 0:
             return None
 
-        if is_narrow:
-            # Preserve line structure: zoom the crop directly
-            zh = max(1, int(box_img.shape[0] * zoom_factor))
-            zw = max(1, int(box_img.shape[1] * zoom_factor))
-            zoomed = cv2.resize(box_img, (zw, zh), interpolation=cv2.INTER_LINEAR)
-            strip = np.ones((zh, new_page_width, 3), dtype=np.uint8)
-            strip[:] = bg
-            copy_w = min(zw, new_page_width)
-            strip[:zh, :copy_w] = zoomed[:, :copy_w]
-            return strip
+        is_title = (det.label == "title")
+        rw = det.x2 - det.x1
+        rh = det.y2 - det.y1
 
-        # Filter word boxes whose centre falls inside this region
         local_boxes = []
         for (x1, y1, x2, y2) in all_word_boxes:
             cx = (x1 + x2) / 2
@@ -175,12 +207,7 @@ def _do_reflow(
         if not local_boxes:
             return None
 
-        # Apply padding to word boxes to prevent letter clipping,
-        # matching the segmentation project behaviour.
-        is_title = (det.label == "title")
         padding = 35 if is_title else 5
-        rw = det.x2 - det.x1
-        rh = det.y2 - det.y1
         local_boxes = [
             (
                 max(0,  lx1 - padding),
@@ -191,56 +218,182 @@ def _do_reflow(
             for (lx1, ly1, lx2, ly2) in local_boxes
         ]
 
-        # Title: merge all word boxes into one + extra padding,
-        # to prevent over-segmentation of decorative letters.
         if is_title and len(local_boxes) > 1:
-            extra_padding = 20
+            extra = 20
             local_boxes = [(
-                max(0,  min(b[0] for b in local_boxes) - extra_padding),
-                max(0,  min(b[1] for b in local_boxes) - extra_padding),
-                min(rw, max(b[2] for b in local_boxes) + extra_padding),
-                min(rh, max(b[3] for b in local_boxes) + extra_padding),
+                max(0,  min(b[0] for b in local_boxes) - extra),
+                max(0,  min(b[1] for b in local_boxes) - extra),
+                min(rw, max(b[2] for b in local_boxes) + extra),
+                min(rh, max(b[3] for b in local_boxes) + extra),
             )]
 
-        lines_raw = line_grouping.group_words_into_lines(local_boxes)
+        lines_raw  = line_grouping.group_words_into_lines(local_boxes)
         word_lines = reflow_words.words_to_wordlines(lines_raw)
 
-        margin = max(10, int(20 * zoom_factor / 2))
-        strip = reflow_words.create_page_word_reflow(
+        return reflow_words.create_page_word_reflow(
             word_lines,
             box_img,
             zoom_factor=zoom_factor,
             new_page_width=new_page_width,
             top_margin=0,
             bottom_margin=0,
-            left_margin=margin,
-            right_margin=margin,
+            left_margin=left_margin,
+            right_margin=right_margin,
             background_color=bg,
-            is_title=(det.label == "title"),
+            is_title=is_title,
         )
-        return strip
 
-    # Process regions in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        strips = list(executor.map(process_region, text_dets))
+    # ------------------------------------------------------------------
+    # Helper: mask non-text regions out of a text crop
+    # ------------------------------------------------------------------
+    def _masked_crop(det) -> np.ndarray:
+        crop = img_bgr[det.y1:det.y2, det.x1:det.x2].copy()
+        for other in all_dets:
+            if other.label in _TEXT_CLASSES:
+                continue
+            # AABB intersection in page coords
+            ix1 = max(det.x1, other.x1)
+            iy1 = max(det.y1, other.y1)
+            ix2 = min(det.x2, other.x2)
+            iy2 = min(det.y2, other.y2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            # Convert to local coords
+            lx1 = max(0, ix1 - det.x1)
+            ly1 = max(0, iy1 - det.y1)
+            lx2 = min(crop.shape[1], ix2 - det.x1)
+            ly2 = min(crop.shape[0], iy2 - det.y1)
+            if lx2 > lx1 and ly2 > ly1:
+                crop[ly1:ly2, lx1:lx2] = bg
+        return crop
 
-    # Filter None results, stack vertically with a small gap
-    strips = [s for s in strips if s is not None]
-    if not strips:
-        h = int(page_img.size[1] * zoom_factor)
-        blank = np.ones((h, new_page_width, 3), dtype=np.uint8)
-        blank[:] = bg
-        return Image.fromarray(blank)
+    # ------------------------------------------------------------------
+    # Main sequential pass (titled_block_title is stateful)
+    # ------------------------------------------------------------------
+    # Allocate a tall canvas; we'll crop at the end
+    canvas_h = max(int(page_h * zoom_factor * 2), 2000)
+    canvas = np.empty((canvas_h, new_page_width, 3), dtype=np.uint8)
+    canvas[:] = bg
+    current_y = 0
 
-    gap_h = max(4, int(12 * zoom_factor))
-    gap = np.ones((gap_h, new_page_width, 3), dtype=np.uint8)
-    gap[:] = bg
+    def _ensure_space(needed: int):
+        nonlocal canvas, canvas_h
+        if current_y + needed > canvas_h:
+            new_h = max(current_y + needed + 1000, canvas_h + 2000)
+            new_canvas = np.empty((new_h, new_page_width, 3), dtype=np.uint8)
+            new_canvas[:] = bg
+            new_canvas[:canvas_h] = canvas
+            canvas = new_canvas
+            canvas_h = new_h
 
-    combined = strips[0]
-    for strip in strips[1:]:
-        combined = np.vstack([combined, gap, strip])
+    def _place(strip: np.ndarray, gap_before: int):
+        nonlocal current_y
+        sh = strip.shape[0]
+        _ensure_space(gap_before + sh)
+        current_y += gap_before
+        canvas[current_y:current_y + sh] = strip
+        current_y += sh
 
-    result_rgb = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
+    # Single line height estimate at 150dpi (12pt body text ≈ 25px).
+    # Used to cap the gap after non-text blocks (figure/table/formula → text).
+    _LINE_H_PX = 25  # original-space pixels
+    _max_nontext_gap = max(min_gap, int(_LINE_H_PX * zoom_factor * 2))
+
+    def _last_placed_label(idx: int) -> Optional[str]:
+        """Return label of last detection that was actually placed (skip titled_block_title / abandon)."""
+        for i in range(idx - 1, -1, -1):
+            if all_dets[i].label not in ("titled_block_title", "abandon"):
+                return all_dets[i].label
+        return None
+
+    pending_title_img: Optional[np.ndarray] = None
+    pending_title_gap: int = 0
+
+    for idx, det in enumerate(all_dets):
+        prev_y2 = all_dets[idx - 1].y2 if idx > 0 else 0
+        next_y1 = all_dets[idx + 1].y1 if idx < len(all_dets) - 1 else page_h
+        gap_before = max(min_gap, int((det.y1 - prev_y2) * zoom_factor))
+        gap_after  = max(min_gap, int((next_y1 - det.y2) * zoom_factor))
+
+        label = det.label
+
+        # Cap gap_before when transitioning from a non-text block to a text block
+        # (direct: figure→text, or indirect: figure→titled_block_title→titled_block_body)
+        if label in _TEXT_CLASSES:
+            last_placed = _last_placed_label(idx)
+            if last_placed in _NON_TEXT_LABELS:
+                gap_before = min(gap_before, _max_nontext_gap)
+
+        # Skip noise
+        if label == "abandon":
+            continue
+
+        # ---- titled_block_title: buffer and skip ----
+        if label == "titled_block_title":
+            pending_title_img = img_bgr[det.y1:det.y2, det.x1:det.x2].copy()
+            # Also cap the buffered gap using the same rule
+            last_placed = _last_placed_label(idx)
+            if last_placed in _NON_TEXT_LABELS:
+                gap_before = min(gap_before, _max_nontext_gap)
+            pending_title_gap = gap_before
+            continue
+
+        # ---- non-text blocks (and titled_block_body narrow path) ----
+        is_text = label in _TEXT_CLASSES
+        block_w = det.x2 - det.x1
+        is_narrow = (
+            label in ("plain text", "titled_block_body")
+            and block_w < median_plain_w * 0.65
+        )
+
+        if not is_text or is_narrow:
+            crop = img_bgr[det.y1:det.y2, det.x1:det.x2].copy()
+
+            if label == "titled_block_body" and pending_title_img is not None:
+                # Stack title on top of body, zoom as one image
+                t_h, t_w = pending_title_img.shape[:2]
+                b_h, b_w = crop.shape[:2]
+                combined_w = max(t_w, b_w)
+                canvas_t = np.empty((t_h, combined_w, 3), dtype=np.uint8)
+                canvas_t[:] = bg
+                canvas_t[:, :t_w] = pending_title_img
+                canvas_b = np.empty((b_h, combined_w, 3), dtype=np.uint8)
+                canvas_b[:] = bg
+                canvas_b[:, :b_w] = crop
+                crop = np.vstack([canvas_t, canvas_b])
+                gap_before = pending_title_gap
+                pending_title_img = None
+                pending_title_gap = 0
+
+            if crop.size == 0:
+                continue
+
+            strip = _zoom_crop(crop)
+            _place(strip, gap_before)
+            continue
+
+        # ---- text block (not narrow) ----
+
+        # titled_block_body (not narrow): first emit pending title as zoomed crop
+        if label == "titled_block_body" and pending_title_img is not None:
+            title_strip = _zoom_crop(pending_title_img)
+            _place(title_strip, pending_title_gap)
+            # gap between title strip and body is the original title→body gap
+            gap_before = max(min_gap, int((det.y1 - all_dets[idx - 1].y2) * zoom_factor))
+            pending_title_img = None
+            pending_title_gap = 0
+
+        crop = _masked_crop(det)
+        strip = _reflow_text(det, crop)
+        if strip is None:
+            continue
+        _place(strip, gap_before)
+
+    # Crop canvas to actual content (add bottom margin from last block to page bottom)
+    current_y += gap_after  # gap_after of last processed block
+    final_h = max(1, current_y)
+    result_bgr = canvas[:final_h]
+    result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(result_rgb)
 
 

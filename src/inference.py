@@ -181,4 +181,8 @@ def detect(
             iou = inter / (area_i + area_j - inter)
             if iou > 0.45:
                 suppressed[j] = True
-    return keep
+    # Group raw detections into semantic blocks (figure+caption, table+caption,
+    # titled_block pairs, plain-text merging, etc.)
+    import block_grouping
+    orig_w, orig_h = pil_image.size
+    return block_grouping.group_detections(keep, img_w=orig_w, img_h=orig_h)
