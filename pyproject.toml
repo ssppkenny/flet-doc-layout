@@ -12,6 +12,8 @@ dependencies = [
     "numpy",
     "opencv-python",
     "certifi",
+    "pypdfium2",
+    "flet-libpdfium",
 ]
 
 [tool.flet.app]
@@ -29,3 +31,7 @@ python-djvulibre = "../mobile-forge/dist/python_djvulibre-0.8.8-cp312-cp312-andr
 flet-libdjvulibre = "../mobile-forge/dist/flet_libdjvulibre-3.5.29-0-py3-none-android_24_arm64_v8a.whl"
 flet-libcpp-shared = "../mobile-forge/dist/flet_libcpp_shared-27.3.13750724-0-py3-none-android_24_arm64_v8a.whl"
 flet-libjpeg = "../mobile-forge/dist/flet_libjpeg-3.0.90-1-py3-none-android_24_arm64_v8a.whl"
+numpy = "../mobile-forge/dist/numpy-2.2.2-cp312-cp312-android_24_arm64_v8a.whl"
+opencv-python = "../mobile-forge/dist/opencv_python-4.10.0.84-cp312-cp312-android_24_arm64_v8a.whl"
+pypdfium2 = "../mobile-forge/dist/pypdfium2-5.8.0-py3-none-android_24_arm64_v8a.whl"
+flet-libpdfium = "../mobile-forge/dist/flet_libpdfium-5.8.0-0-py3-none-android_24_arm64_v8a.whl"
