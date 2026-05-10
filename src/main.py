@@ -21,6 +21,7 @@ import inference
 import doctr_inference
 import line_grouping
 import reflow_words
+import skew_detection
 
 # ---------------------------------------------------------------------------
 # Model download configuration
@@ -501,6 +502,12 @@ async def main(page: ft.Page):
         on_click=lambda _: asyncio.ensure_future(cycle_zoom()),
         disabled=True,
     )
+    btn_fix_skew = ft.IconButton(
+        icon=ft.Icons.STRAIGHTEN,
+        tooltip="Fix skew",
+        on_click=lambda _: asyncio.ensure_future(fix_skew()),
+        disabled=True,
+    )
     dd_lang = ft.Dropdown(
         value="en",
         width=160,
@@ -586,6 +593,7 @@ async def main(page: ft.Page):
         btn_reflow.disabled = True
         btn_zoom.disabled = True
         btn_zoom.text = f"{ZOOM_STEPS[0]:g}×"
+        btn_fix_skew.disabled = True
         page.update()
         set_status(f"Rendering page {index + 1}…")
         await asyncio.sleep(0)
@@ -607,6 +615,7 @@ async def main(page: ft.Page):
         btn_next.disabled = index >= state["total_pages"] - 1
         models_ready = state["net"] is not None and state["doctr_net"] is not None
         btn_reflow.disabled = not models_ready
+        btn_fix_skew.disabled = not models_ready
         page.update()
         refresh_image()
         set_status("Ready.")
@@ -704,6 +713,45 @@ async def main(page: ft.Page):
         state["show_reflow"] = False
         await run_reflow()
 
+    async def fix_skew():
+        page_img = state.get("page_image")
+        dets = state.get("reflow_dets")
+        if page_img is None or dets is None:
+            return
+        btn_fix_skew.disabled = True
+        btn_fix_skew.icon = ft.Icons.HOURGLASS_TOP
+        btn_fix_skew.update()
+        try:
+            img_bgr = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: cv2.cvtColor(np.array(page_img.convert("RGB")), cv2.COLOR_RGB2BGR),
+            )
+            angle = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: skew_detection.detect_skew_in_text_regions(img_bgr, dets),
+            )
+            if abs(angle) > 0.1:
+                corrected_bgr = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: skew_detection.rotate_image(img_bgr, angle),
+                )
+                corrected_rgb = cv2.cvtColor(corrected_bgr, cv2.COLOR_BGR2RGB)
+                state["page_image"] = Image.fromarray(corrected_rgb)
+                # Invalidate all caches for this page so reflow uses corrected image
+                state["reflow_dets"] = None
+                state["reflow_word_boxes"] = None
+                state["reflow_image"] = None
+                state["show_reflow"] = False
+                set_status(f"Skew corrected ({angle:+.2f}°)")
+            else:
+                set_status("No significant skew detected")
+        except Exception as exc:
+            set_status(f"Skew fix failed: {exc}")
+        finally:
+            btn_fix_skew.disabled = False
+            btn_fix_skew.icon = ft.Icons.STRAIGHTEN
+            btn_fix_skew.update()
+
     # ---- file picker ----
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
@@ -770,7 +818,7 @@ async def main(page: ft.Page):
             ft.Row([btn_open, btn_prev, page_label, btn_next], spacing=8),
             img_container,
             ft.Row(
-                [btn_reflow, btn_zoom, dd_lang],
+                [btn_reflow, btn_zoom, btn_fix_skew, dd_lang],
                 alignment=ft.MainAxisAlignment.CENTER,
                 spacing=12,
             ),
