@@ -17,9 +17,9 @@ import cv2
 import numpy as np
 import flet as ft
 from PIL import Image
-
 import inference
 import doctr_inference
+import lang_detect
 import line_grouping
 import reflow_words
 import skew_detection
@@ -31,8 +31,13 @@ _RELEASE_BASE = (
     "https://github.com/ssppkenny/flet-doc-layout/releases/download/models"
 )
 MODEL_URLS = {
-    "doclayout.onnx": (f"{_RELEASE_BASE}/doclayout.onnx", 75512430),
-    "fast_base.onnx": (f"{_RELEASE_BASE}/fast_base.onnx", 65436251),
+    "doclayout.onnx":              (f"{_RELEASE_BASE}/doclayout.onnx",              75512430),
+    "fast_base.onnx":              (f"{_RELEASE_BASE}/fast_base.onnx",              65436251),
+    "crnn_mobilenet_v3_small_v11.onnx": (f"{_RELEASE_BASE}/crnn_mobilenet_v3_small_v11.onnx", 8336543),
+    "cyrillic_rec_sim.onnx":       (f"{_RELEASE_BASE}/cyrillic_rec_sim.onnx",       8005590),
+    "greek_rec_sim.onnx":          (f"{_RELEASE_BASE}/greek_rec_sim.onnx",          7765526),
+    "cyrillic_vocab.json":         (f"{_RELEASE_BASE}/cyrillic_vocab.json",         5333),
+    "greek_vocab.json":            (f"{_RELEASE_BASE}/greek_vocab.json",            2166),
 }
 
 
@@ -58,40 +63,9 @@ _NON_TEXT_LABELS = {
     "table", "table_and_caption", "table_caption", "table_footnote",
     "isolate_formula", "isolate_formula_and_caption", "formula_caption",
 }
-ZOOM_STEPS = [2.0, 1.5, 1.0]
+ZOOM_INCREMENT = 1.2  # each zoom button press multiplies by this factor
 
-LANGUAGES = [
-    ("en", "English"),
-    ("ru", "Russian"),
-    ("de", "German"),
-    ("fr", "French"),
-    ("es", "Spanish"),
-    ("pl", "Polish"),
-    ("uk", "Ukrainian"),
-    ("bg", "Bulgarian"),
-    ("cs", "Czech"),
-    ("sk", "Slovak"),
-    ("nl", "Dutch"),
-    ("pt", "Portuguese"),
-    ("it", "Italian"),
-    ("sv", "Swedish"),
-    ("da", "Danish"),
-    ("fi", "Finnish"),
-    ("nb", "Norwegian"),
-    ("hu", "Hungarian"),
-    ("ro", "Romanian"),
-    ("hr", "Croatian"),
-    ("sr", "Serbian"),
-    ("sl", "Slovenian"),
-    ("lt", "Lithuanian"),
-    ("lv", "Latvian"),
-    ("et", "Estonian"),
-    ("be", "Belarusian"),
-    ("ca", "Catalan"),
-    ("eu", "Basque"),
-    ("gl", "Galician"),
-    ("ga", "Irish"),
-]
+LANGUAGES = lang_detect.LANGUAGES
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +107,8 @@ def render_pdf_page(pdf_doc, page_index: int, dpi: int = 150) -> Image.Image:
     scale = dpi / 72.0
     bitmap = page.render(scale=scale)
     return bitmap.to_pil()
+
+
 
 
 def _do_reflow(
@@ -234,6 +210,8 @@ def _do_reflow(
 
         if not local_boxes:
             return None
+
+        local_boxes = reflow_words.clamp_word_boxes(local_boxes)
 
         padding = 35 if is_title else 5
         local_boxes = [
@@ -481,13 +459,17 @@ async def main(page: ft.Page):
         "page_image": None,         # PIL Image — original render
         "net": None,                # DocLayout-YOLO model
         "doctr_net": None,          # fast_base ONNX model
+        "lang_detector": None,      # LangDetector (CommonLingua + CRNN)
         "reflow_image": None,       # PIL Image — reflowed (None until computed)
         "reflow_dets": None,        # cached layout detections for current page
         "reflow_word_boxes": None,  # cached full-page word boxes for current page
         "show_reflow": False,
-        "zoom_level": 0,            # index into ZOOM_STEPS
+        "base_zoom": None,           # auto-computed from median word width
+        "zoom_step": 0,             # number of ×1.2 increments on top of base_zoom
         "container_w": 0,
         "lang": "en",               # user-selected ISO 639-1 code
+        "pdf_lock": asyncio.Lock(), # serializes pypdfium2 access (not thread-safe)
+        "doctr_lock": asyncio.Lock(), # serializes cv2.dnn inference (not thread-safe)
     }
 
     # ---- controls ----
@@ -536,7 +518,7 @@ async def main(page: ft.Page):
         disabled=True,
     )
     btn_zoom = ft.ElevatedButton(
-        f"{ZOOM_STEPS[0]:g}×",
+        "auto×",
         icon=ft.Icons.ZOOM_IN,
         on_click=lambda _: asyncio.ensure_future(cycle_zoom()),
         disabled=True,
@@ -591,7 +573,17 @@ async def main(page: ft.Page):
         w = int(e.width)
         if w <= 0:
             return
+        old_w = state["container_w"]
         state["container_w"] = w
+        if abs(w - old_w) > 20 and state["base_zoom"] is not None:
+            # Width changed significantly (e.g. rotation) — invalidate reflow
+            # image so it is re-rendered at the new width. Keep base_zoom,
+            # zoom_step, reflow_dets and reflow_word_boxes — all still valid.
+            # zoom_factor stays the same → letters appear the same physical size.
+            state["reflow_image"] = None
+            state["show_reflow"] = False  # prevent toggle-off branch in run_reflow
+            asyncio.ensure_future(run_reflow())
+            return
         refresh_image()
 
     img_container.on_size_change = on_container_resize
@@ -611,7 +603,20 @@ async def main(page: ft.Page):
             state["doctr_net"] = await loop.run_in_executor(
                 None, lambda: doctr_inference.load_model(str(doctr_path))
             )
-            set_status("Models ready. Open a DjVu or PDF file.")
+            # Load language detector from downloaded models dir
+            set_status("Loading language models…")
+            try:
+                state["lang_detector"] = await loop.run_in_executor(
+                    None,
+                    lambda: lang_detect.load_models(str(models_d)),
+                )
+                if state["lang_detector"] is None:
+                    set_status("Models ready. Lang detector returned None.")
+                else:
+                    set_status("Models ready. Open a DjVu or PDF file.")
+            except Exception as _e:
+                set_status(f"Models ready. Lang load error: {_e}")
+                return
             if state["page_image"] is not None:
                 btn_reflow.disabled = False
                 btn_reflow.update()
@@ -627,11 +632,12 @@ async def main(page: ft.Page):
         state["reflow_dets"] = None
         state["reflow_word_boxes"] = None
         state["show_reflow"] = False
-        state["zoom_level"] = 0
+        state["base_zoom"] = None
+        state["zoom_step"] = 0
         btn_reflow.text = "Reflow"
         btn_reflow.disabled = True
         btn_zoom.disabled = True
-        btn_zoom.text = f"{ZOOM_STEPS[0]:g}×"
+        btn_zoom.text = "auto×"
         btn_fix_skew.disabled = True
         page.update()
         set_status(f"Rendering page {index + 1}…")
@@ -639,9 +645,10 @@ async def main(page: ft.Page):
         try:
             loop = asyncio.get_event_loop()
             if state["doc_type"] == "pdf":
-                state["page_image"] = await loop.run_in_executor(
-                    None, lambda: render_pdf_page(state["pdf_doc"], index)
-                )
+                async with state["pdf_lock"]:
+                    state["page_image"] = await loop.run_in_executor(
+                        None, lambda: render_pdf_page(state["pdf_doc"], index)
+                    )
             else:
                 state["page_image"] = await loop.run_in_executor(
                     None, lambda: render_djvu_page(state["doc_path"], index)
@@ -663,6 +670,90 @@ async def main(page: ft.Page):
         new_idx = state["page_index"] + delta
         if 0 <= new_idx < state["total_pages"]:
             await load_page(new_idx)
+
+    async def detect_language_bg():
+        """
+        Sample pages from the middle of the book, run CRNN + CommonLingua,
+        and auto-set the language dropdown.
+        """
+        detector = state.get("lang_detector")
+        if detector is None:
+            print("[detect_language_bg] lang_detector is None, skipping")
+            set_status("Lang detector not loaded.")
+            return
+        total = state.get("total_pages", 0)
+        if total == 0 or state["doc_path"] is None:
+            return
+
+        # Wait for doctr_net to be ready (it may still be loading)
+        for _ in range(60):
+            if state.get("doctr_net") is not None:
+                break
+            await asyncio.sleep(1.0)
+        else:
+            print("[detect_language_bg] doctr_net never became ready, skipping")
+            return
+
+        set_status("Detecting language…")
+        await asyncio.sleep(0)
+
+        # Pick up to 3 pages from the middle quarter of the book
+        mid = total // 2
+        quarter = max(1, total // 4)
+        candidates = list(range(max(0, mid - quarter), min(total, mid + quarter)))
+        step = max(1, len(candidates) // 3)
+        sample_pages = candidates[::step][:3]
+
+        loop = asyncio.get_event_loop()
+
+        def _render_pages():
+            images = []
+            for pg_idx in sample_pages:
+                try:
+                    if state["doc_type"] == "pdf":
+                        img = render_pdf_page(state["pdf_doc"], pg_idx)
+                    else:
+                        img = render_djvu_page(state["doc_path"], pg_idx)
+                    if img is not None:
+                        images.append(img)
+                except Exception:
+                    continue
+            return images
+
+        def _detect_words_single(img):
+            doctr_net = state.get("doctr_net")
+            if doctr_net is None:
+                return None
+            return doctr_inference.detect_words(doctr_net, img)
+
+        try:
+            async with state["pdf_lock"]:
+                images = await loop.run_in_executor(None, _render_pages)
+            # Detect words one page at a time, releasing the lock between pages
+            # so run_reflow can acquire it without waiting for all 3 pages.
+            word_boxes_list = []
+            for img in images:
+                try:
+                    async with state["doctr_lock"]:
+                        boxes = await loop.run_in_executor(None, lambda i=img: _detect_words_single(i))
+                    if boxes is not None:
+                        word_boxes_list.append(boxes)
+                except Exception:
+                    continue
+            if word_boxes_list:
+                lang_code, conf = detector.detect(word_boxes_list, images[:len(word_boxes_list)])
+            else:
+                lang_code, conf = None, 0.0
+            if lang_code:
+                state["lang"] = lang_code
+                dd_lang.value = lang_code
+                dd_lang.update()
+                conf_pct = int(conf * 100)
+                set_status(f"Language detected: {lang_code} ({conf_pct}%)")
+            else:
+                set_status("Ready.")
+        except Exception as e:
+            set_status(f"Lang detect error: {e}")
 
     # ---- reflow ----
     async def run_reflow():
@@ -711,16 +802,26 @@ async def main(page: ft.Page):
             # Step 2: word detection — one call on full page (cached across zoom changes)
             if state["reflow_word_boxes"] is None:
                 set_status("Detecting words…")
-                word_boxes = await loop.run_in_executor(
-                    None, lambda: doctr_inference.detect_words(state["doctr_net"], page_img)
-                )
+                async with state["doctr_lock"]:
+                    word_boxes = await loop.run_in_executor(
+                        None, lambda: doctr_inference.detect_words(state["doctr_net"], page_img)
+                    )
                 state["reflow_word_boxes"] = word_boxes
             else:
                 word_boxes = state["reflow_word_boxes"]
 
             # Step 3: per-region reflow (parallel inside _do_reflow)
             set_status("Reflowing…")
-            zoom_factor = ZOOM_STEPS[state["zoom_level"]]
+            if state["base_zoom"] is None:
+                margin = max(10, int(20 / 2))
+                available_w = max(state["container_w"], 300) - 2 * margin
+                ws = [x2 - x1 for x1, y1, x2, y2 in word_boxes if x2 > x1]
+                median_word_w = float(np.median(ws)) if ws else 50.0
+                base = available_w / (median_word_w * 4.0)
+                state["base_zoom"] = max(0.5, min(5.0, base))
+                state["zoom_step"] = 0
+            zoom_factor = state["base_zoom"] * (ZOOM_INCREMENT ** state["zoom_step"])
+            btn_zoom.text = f"{zoom_factor:.2g}×"
             new_page_width = max(state["container_w"], 300)
 
             reflow_img = await loop.run_in_executor(
@@ -743,9 +844,9 @@ async def main(page: ft.Page):
         refresh_image()
 
     async def cycle_zoom():
-        state["zoom_level"] = (state["zoom_level"] + 1) % len(ZOOM_STEPS)
-        z = ZOOM_STEPS[state["zoom_level"]]
-        btn_zoom.text = f"{z:g}×"
+        state["zoom_step"] += 1
+        zoom_factor = state["base_zoom"] * (ZOOM_INCREMENT ** state["zoom_step"])
+        btn_zoom.text = f"{zoom_factor:.2g}×"
         btn_zoom.update()
         # Invalidate reflow cache (dets and word_boxes are kept)
         state["reflow_image"] = None
@@ -846,6 +947,8 @@ async def main(page: ft.Page):
             set_status(f"Error opening file: {ex}\n{traceback.format_exc()}")
             return
         await load_page(0)
+        # Detect language in background (samples middle pages)
+        # asyncio.ensure_future(detect_language_bg())  # temporarily disabled
 
     # ---- layout ----
     # ---- normal UI layout ----

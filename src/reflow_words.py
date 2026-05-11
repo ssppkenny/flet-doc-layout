@@ -55,6 +55,74 @@ class _PlacedWord:
 
 
 # ---------------------------------------------------------------------------
+# clamp_word_boxes — vertical clamping to suppress inter-line bleed
+# ---------------------------------------------------------------------------
+
+def clamp_word_boxes(
+    boxes: List[Tuple[int, int, int, int]],
+    slack: float = 1.15,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Clamp each word box's vertical extent to suppress bleed from adjacent lines.
+
+    Strategy:
+      1. Group boxes into lines by y-center proximity (gap < median_h * 0.6).
+      2. For each line compute the median box height.
+      3. Clamp each box to [cy - median_h/2 * slack, cy + median_h/2 * slack]
+         where cy is the box's y-center.
+
+    slack=1.15 allows 15% extra for ascenders/descenders/diacritics while
+    still cutting boxes that span two lines (which are typically 2× too tall).
+
+    Boxes that are already within the clamped range are returned unchanged.
+    """
+    if not boxes:
+        return boxes
+
+    heights = [y2 - y1 for x1, y1, x2, y2 in boxes]
+    median_h = float(np.median(heights))
+
+    # Group into lines: sort by y-center, start new line when gap > median_h * 0.6
+    sorted_boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2)
+    lines: List[List[Tuple[int, int, int, int]]] = []
+    current_line: List[Tuple[int, int, int, int]] = []
+    prev_cy = None
+    for box in sorted_boxes:
+        cy = (box[1] + box[3]) / 2
+        if prev_cy is None or cy - prev_cy < median_h * 0.6:
+            current_line.append(box)
+        else:
+            lines.append(current_line)
+            current_line = [box]
+        prev_cy = cy
+    if current_line:
+        lines.append(current_line)
+
+    # Clamp each box using its line's median height,
+    # but never use a line median larger than the global median
+    # (handles isolated oversized boxes that form their own "line")
+    result: List[Tuple[int, int, int, int]] = []
+    for line in lines:
+        line_heights = [y2 - y1 for x1, y1, x2, y2 in line]
+        line_median_h = min(float(np.median(line_heights)), median_h)
+        half = line_median_h / 2 * slack
+        for x1, y1, x2, y2 in line:
+            cy = (y1 + y2) / 2
+            new_y1 = int(cy - half)
+            new_y2 = int(cy + half)
+            # Only clamp if the box is actually oversized — never expand
+            clamped_y1 = max(y1, new_y1)
+            clamped_y2 = min(y2, new_y2)
+            # Safety: don't produce empty boxes
+            if clamped_y2 <= clamped_y1:
+                result.append((x1, y1, x2, y2))
+            else:
+                result.append((x1, clamped_y1, x2, clamped_y2))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # find_rects — letter-component detection (ported from segmentation/main.py)
 # ---------------------------------------------------------------------------
 
@@ -695,16 +763,16 @@ def create_page_word_reflow(
         page[:] = background_color
         return page
 
-    # Line height: 95th percentile of scaled word heights × 1.5
-    all_scaled_heights = [
-        int(pw.word.height * zoom_factor)
+    # Line height: 95th percentile of scaled cap-heights × 1.3  (≈130% leading)
+    all_above = [
+        int(pw.word.above * zoom_factor)
         for ol in output_lines
         for pw in ol['words']
-        if pw.word.height > 0
+        if pw.word.above > 0
     ]
-    if all_scaled_heights:
-        p95 = int(np.percentile(all_scaled_heights, 95))
-        line_height = int(p95 * 1.5)
+    if all_above:
+        p95_above = int(np.percentile(all_above, 95))
+        line_height = int(p95_above * 1.3)
     else:
         line_height = 60
 
