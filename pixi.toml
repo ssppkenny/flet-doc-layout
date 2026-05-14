@@ -6,7 +6,11 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-build-apk = "flet build apk --arch arm64-v8a --yes"
+build-apk = { cmd = """flet build apk --arch arm64-v8a --yes \
+  && zip -d build/apk/flow-reader.apk 'lib/armeabi-v7a/*' 'lib/x86/*' 'lib/x86_64/*' \
+  && /opt/android-sdk/build-tools/36.0.0/zipalign -f -p 4 build/apk/flow-reader.apk build/apk/flow-reader-aligned.apk \
+  && /opt/android-sdk/build-tools/36.0.0/apksigner sign --ks ~/.config/.android/debug.keystore --ks-pass pass:android --key-pass pass:android --out build/apk/flow-reader.apk build/apk/flow-reader-aligned.apk \
+  && rm build/apk/flow-reader-aligned.apk""", env = { GRADLE_OPTS = "-Xmx4g -XX:MaxMetaspaceSize=2g" } }
 
 [dependencies]
 python = "3.12.*"

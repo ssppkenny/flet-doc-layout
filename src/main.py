@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import traceback
 import urllib.request
@@ -22,6 +23,7 @@ import doctr_inference
 import lang_detect
 import line_grouping
 import reflow_words
+import server_inference
 import skew_detection
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,30 @@ def _models_ok() -> bool:
         if not f.exists() or f.stat().st_size != expected_size:
             return False
     return True
+
+
+def _settings_path() -> Path:
+    storage = os.environ.get("FLET_APP_STORAGE_DATA")
+    if storage:
+        return Path(storage) / "settings.json"
+    return Path(__file__).parent / "assets" / "settings.json"
+
+
+def _load_settings() -> dict:
+    p = _settings_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_settings(data: dict):
+    p = _settings_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2))
+
 
 _TEXT_CLASSES    = {"plain text", "title", "titled_block_body"}
 _NON_TEXT_LABELS = {
@@ -118,6 +144,8 @@ def _do_reflow(
     zoom_factor: float,
     new_page_width: int,
     lang: str = "en",
+    force_left_margin: int = None,
+    force_right_margin: int = None,
 ) -> Image.Image:
     """
     Per-region reflow. Runs in a thread executor (no Flet state access).
@@ -160,8 +188,12 @@ def _do_reflow(
     ]
     median_plain_w = float(np.median(plain_widths)) if plain_widths else page_w
 
-    left_margin  = max(10, int(20 * zoom_factor / 2))
-    right_margin = left_margin
+    if force_left_margin is not None:
+        left_margin  = force_left_margin
+        right_margin = force_right_margin if force_right_margin is not None else force_left_margin
+    else:
+        left_margin  = max(10, int(20 * zoom_factor / 2))
+        right_margin = left_margin
     available_w  = new_page_width - left_margin - right_margin
     min_gap      = 4
 
@@ -460,17 +492,30 @@ async def main(page: ft.Page):
         "net": None,                # DocLayout-YOLO model
         "doctr_net": None,          # fast_base ONNX model
         "lang_detector": None,      # LangDetector (CommonLingua + CRNN)
-        "reflow_image": None,       # PIL Image — reflowed (None until computed)
-        "reflow_dets": None,        # cached layout detections for current page
-        "reflow_word_boxes": None,  # cached full-page word boxes for current page
-        "show_reflow": False,
+        "local_reflow_image": None,  # PIL Image — reflowed by local models
+        "local_dets": None,         # cached layout detections (local)
+        "local_word_boxes": None,   # cached word boxes (local)
+        "server_reflow_image": None, # PIL Image — reflowed by server
+        "server_dets": None,        # cached layout detections (server)
+        "server_word_boxes": None,  # cached word boxes (server)
+        "server_left_margin": None, # content-aware left margin from server
+        "server_right_margin": None, # content-aware right margin from server
+        "server_page_img": None,    # 300 DPI image used for server reflow
+        "last_reflow_mode": None,   # "local" or "server" — for cycle_zoom
         "base_zoom": None,           # auto-computed from median word width
         "zoom_step": 0,             # number of ×1.2 increments on top of base_zoom
         "container_w": 0,
         "lang": "en",               # user-selected ISO 639-1 code
         "pdf_lock": asyncio.Lock(), # serializes pypdfium2 access (not thread-safe)
         "doctr_lock": asyncio.Lock(), # serializes cv2.dnn inference (not thread-safe)
+        "server_url": "http://localhost:8000",  # remote server URL
+        "skew_angle": 0.0,          # last skew angle returned by server
     }
+
+    # Load persisted settings
+    _settings = _load_settings()
+    if "server_url" in _settings:
+        state["server_url"] = str(_settings["server_url"])
 
     # ---- controls ----
     status_text = ft.Text("Loading models…", color=ft.Colors.GREY_400, size=13)
@@ -486,10 +531,16 @@ async def main(page: ft.Page):
                 ft.Container(
                     content=spinner,
                     alignment=ft.Alignment(0, 0),
-                    expand=True,
                 ),
             ],
-            expand=True,
+        ),
+    )
+
+    scroll_wrapper = ft.Container(
+        content=ft.Column(
+            controls=[img_container],
+            scroll=ft.ScrollMode.ALWAYS,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         ),
         expand=True,
     )
@@ -511,16 +562,17 @@ async def main(page: ft.Page):
         icon=ft.Icons.FOLDER_OPEN,
         on_click=lambda e: asyncio.ensure_future(open_file(e)),
     )
-    btn_reflow = ft.ElevatedButton(
-        "Reflow",
-        icon=ft.Icons.WRAP_TEXT,
-        on_click=lambda _: asyncio.ensure_future(run_reflow()),
+    btn_zoom_out = ft.IconButton(
+        icon=ft.Icons.TEXT_DECREASE,
+        tooltip="Zoom out (fewer words per line)",
+        on_click=lambda _: asyncio.ensure_future(do_zoom(-1)),
         disabled=True,
     )
-    btn_zoom = ft.ElevatedButton(
-        "auto×",
-        icon=ft.Icons.ZOOM_IN,
-        on_click=lambda _: asyncio.ensure_future(cycle_zoom()),
+    txt_zoom = ft.Text("—", width=48, text_align=ft.TextAlign.CENTER)
+    btn_zoom_in = ft.IconButton(
+        icon=ft.Icons.TEXT_INCREASE,
+        tooltip="Zoom in (more words per line)",
+        on_click=lambda _: asyncio.ensure_future(do_zoom(+1)),
         disabled=True,
     )
     btn_fix_skew = ft.IconButton(
@@ -537,6 +589,25 @@ async def main(page: ft.Page):
             for code, name in LANGUAGES
         ],
         on_select=lambda e: _on_lang_select(e.control.value),
+     )
+    btn_reflow_local = ft.ElevatedButton(
+        "Local",
+        icon=ft.Icons.COMPUTER,
+        disabled=True,
+        on_click=lambda _: asyncio.ensure_future(run_reflow("local")),
+    )
+    btn_reflow_server = ft.ElevatedButton(
+        "Server",
+        icon=ft.Icons.CLOUD,
+        disabled=not bool(state["server_url"]),
+        on_click=lambda _: asyncio.ensure_future(run_reflow("server")),
+    )
+    tf_server_url = ft.TextField(
+        value=state["server_url"],
+        label="Server URL",
+        width=260,
+        on_submit=lambda e: _on_server_url_change(e.control.value),
+        on_blur=lambda e: _on_server_url_change(e.control.value),
     )
 
     # ---- helpers ----
@@ -547,14 +618,25 @@ async def main(page: ft.Page):
     def _on_lang_select(code: str):
         if code and code != state["lang"]:
             state["lang"] = code
-            state["reflow_image"] = None
-            state["show_reflow"] = False
+            state["local_reflow_image"] = None
+            state["server_reflow_image"] = None
+
+    def _on_server_url_change(url: str):
+        url = url.strip()
+        if url != state["server_url"]:
+            state["server_url"] = url
+            btn_reflow_server.disabled = not bool(url)
+            btn_reflow_server.update()
+            _save_settings({"server_url": url})
 
     def refresh_image():
-        if state["show_reflow"] and state["reflow_image"] is not None:
-            img = state["reflow_image"]
-        else:
-            img = state["page_image"]
+        # Show the most recently computed reflow image, or the original page
+        reflow_img = None
+        if state["last_reflow_mode"] == "server" and state["server_reflow_image"] is not None:
+            reflow_img = state["server_reflow_image"]
+        elif state["last_reflow_mode"] == "local" and state["local_reflow_image"] is not None:
+            reflow_img = state["local_reflow_image"]
+        img = reflow_img if reflow_img is not None else state["page_image"]
         if img is None:
             return
         w = state["container_w"]
@@ -577,16 +659,17 @@ async def main(page: ft.Page):
         state["container_w"] = w
         if abs(w - old_w) > 20 and state["base_zoom"] is not None:
             # Width changed significantly (e.g. rotation) — invalidate reflow
-            # image so it is re-rendered at the new width. Keep base_zoom,
-            # zoom_step, reflow_dets and reflow_word_boxes — all still valid.
-            # zoom_factor stays the same → letters appear the same physical size.
-            state["reflow_image"] = None
-            state["show_reflow"] = False  # prevent toggle-off branch in run_reflow
-            asyncio.ensure_future(run_reflow())
-            return
+            # images so they are re-rendered at the new width. Keep base_zoom,
+            # zoom_step, dets and word_boxes — all still valid.
+            state["local_reflow_image"] = None
+            state["server_reflow_image"] = None
+            mode = state["last_reflow_mode"]
+            if mode is not None:
+                asyncio.ensure_future(run_reflow(mode))
+                return
         refresh_image()
 
-    img_container.on_size_change = on_container_resize
+    scroll_wrapper.on_size_change = on_container_resize
 
     # ---- model loading ----
     async def load_model_bg():
@@ -618,8 +701,8 @@ async def main(page: ft.Page):
                 set_status(f"Models ready. Lang load error: {_e}")
                 return
             if state["page_image"] is not None:
-                btn_reflow.disabled = False
-                btn_reflow.update()
+                btn_reflow_local.disabled = False
+                btn_reflow_local.update()
         except Exception as e:
             set_status(f"Model load failed: {e}\n{traceback.format_exc()}")
 
@@ -628,16 +711,24 @@ async def main(page: ft.Page):
         if state["doc_path"] is None:
             return
         state["page_index"] = index
-        state["reflow_image"] = None
-        state["reflow_dets"] = None
-        state["reflow_word_boxes"] = None
-        state["show_reflow"] = False
+        state["local_reflow_image"] = None
+        state["local_dets"] = None
+        state["local_word_boxes"] = None
+        state["server_reflow_image"] = None
+        state["server_dets"] = None
+        state["server_word_boxes"] = None
+        state["server_left_margin"] = None
+        state["server_right_margin"] = None
+        state["server_page_img"] = None
+        state["skew_angle"] = 0.0
+        state["last_reflow_mode"] = None
         state["base_zoom"] = None
-        state["zoom_step"] = 0
-        btn_reflow.text = "Reflow"
-        btn_reflow.disabled = True
-        btn_zoom.disabled = True
-        btn_zoom.text = "auto×"
+        # zoom_step intentionally NOT reset here — carries over across pages.
+        # It is reset only when a new document is opened.
+        btn_reflow_local.disabled = True
+        btn_reflow_server.disabled = True
+        btn_zoom_out.disabled = True
+        btn_zoom_in.disabled = True
         btn_fix_skew.disabled = True
         page.update()
         set_status(f"Rendering page {index + 1}…")
@@ -660,8 +751,9 @@ async def main(page: ft.Page):
         btn_prev.disabled = index == 0
         btn_next.disabled = index >= state["total_pages"] - 1
         models_ready = state["net"] is not None and state["doctr_net"] is not None
-        btn_reflow.disabled = not models_ready
-        btn_fix_skew.disabled = not models_ready
+        btn_reflow_local.disabled = not models_ready
+        btn_reflow_server.disabled = not bool(state["server_url"])
+        btn_fix_skew.disabled = not (models_ready or bool(state["server_url"]))
         page.update()
         refresh_image()
         set_status("Ready.")
@@ -756,135 +848,212 @@ async def main(page: ft.Page):
             set_status(f"Lang detect error: {e}")
 
     # ---- reflow ----
-    async def run_reflow():
-        # Toggle back to original if currently showing reflow
-        if state["show_reflow"]:
-            state["show_reflow"] = False
-            btn_reflow.text = "Reflow"
-            btn_zoom.disabled = True
-            page.update()
-            refresh_image()
-            return
-
-        # If cached reflow exists at current zoom, just show it
-        if state["reflow_image"] is not None:
-            state["show_reflow"] = True
-            btn_reflow.text = "Original"
-            btn_zoom.disabled = False
-            page.update()
-            refresh_image()
-            return
-
+    async def run_reflow(mode: str):
+        """mode is "local" or "server"."""
         page_img = state["page_image"]
         if page_img is None:
             return
 
-        # Show spinner, disable buttons
+        dets_key   = f"{mode}_dets"
+        boxes_key  = f"{mode}_word_boxes"
+        image_key  = f"{mode}_reflow_image"
+        btn        = btn_reflow_local if mode == "local" else btn_reflow_server
+
+        # If cached reflow image exists, just display it
+        if state[image_key] is not None:
+            state["last_reflow_mode"] = mode
+            btn_zoom_out.disabled = False
+            btn_zoom_in.disabled = False
+            page.update()
+            refresh_image()
+            return
+
+        # Show spinner, disable the pressed button
         spinner.visible = True
-        page.update()
-        btn_reflow.disabled = True
-        btn_zoom.disabled = True
+        btn.disabled = True
+        btn_zoom_out.disabled = True
+        btn_zoom_in.disabled = True
         page.update()
 
         try:
             loop = asyncio.get_event_loop()
 
-            # Step 1: layout detection (cached across zoom changes)
-            if state["reflow_dets"] is None:
-                set_status("Detecting layout…")
-                dets = await loop.run_in_executor(
-                    None, lambda: inference.detect(state["net"], page_img)
-                )
-                state["reflow_dets"] = dets
-            else:
-                dets = state["reflow_dets"]
+            if mode == "server":
+                # ---- Server mode: send image to remote server ----
+                if state[dets_key] is None:
+                    set_status("Sending page to server…")
+                    # Render at 300 DPI for server mode to match CLI quality
+                    if state["doc_type"] == "pdf":
+                        async with state["pdf_lock"]:
+                            server_page_img = await loop.run_in_executor(
+                                None, lambda: render_pdf_page(state["pdf_doc"], state["page_index"], dpi=300)
+                            )
+                    else:
+                        server_page_img = await loop.run_in_executor(
+                            None, lambda: render_djvu_page(state["doc_path"], state["page_index"], dpi=300)
+                        )
+                    img_bytes = io.BytesIO()
+                    server_page_img.save(img_bytes, format="JPEG", quality=95)
+                    img_bytes = img_bytes.getvalue()
 
-            # Step 2: word detection — one call on full page (cached across zoom changes)
-            if state["reflow_word_boxes"] is None:
-                set_status("Detecting words…")
-                async with state["doctr_lock"]:
-                    word_boxes = await loop.run_in_executor(
-                        None, lambda: doctr_inference.detect_words(state["doctr_net"], page_img)
+                    new_page_width = max(state["container_w"], 300)
+
+                    srv_result = await loop.run_in_executor(
+                        None,
+                        lambda: server_inference.analyze_page_bytes(
+                            image_bytes=img_bytes,
+                            filename="page.jpg",
+                            server_url=state["server_url"],
+                            page_width=new_page_width,
+                            zoom_factor=2.5,
+                            lang=state["lang"] if state["lang"] != "en" else None,
+                            toc_algorithm="none",
+                        ),
                     )
-                state["reflow_word_boxes"] = word_boxes
-            else:
-                word_boxes = state["reflow_word_boxes"]
 
-            # Step 3: per-region reflow (parallel inside _do_reflow)
+                    state["skew_angle"] = srv_result.skew_angle
+                    state[dets_key]  = srv_result.dets
+                    state[boxes_key] = srv_result.word_boxes
+                    state["server_left_margin"]  = srv_result.left_margin
+                    state["server_right_margin"] = srv_result.right_margin
+                    state["server_page_img"] = server_page_img
+
+                dets = state[dets_key]
+                word_boxes = state[boxes_key]
+
+            else:
+                # ---- Local mode: run ONNX models on device ----
+                if state[dets_key] is None:
+                    set_status("Detecting layout…")
+                    dets = await loop.run_in_executor(
+                        None, lambda: inference.detect(state["net"], page_img)
+                    )
+                    state[dets_key] = dets
+                else:
+                    dets = state[dets_key]
+
+                if state[boxes_key] is None:
+                    set_status("Detecting words…")
+                    async with state["doctr_lock"]:
+                        word_boxes = await loop.run_in_executor(
+                            None, lambda: doctr_inference.detect_words(state["doctr_net"], page_img)
+                        )
+                    state[boxes_key] = word_boxes
+                else:
+                    word_boxes = state[boxes_key]
+
+            # Step 3: per-region reflow
             set_status("Reflowing…")
-            if state["base_zoom"] is None:
-                margin = max(10, int(20 / 2))
-                available_w = max(state["container_w"], 300) - 2 * margin
-                ws = [x2 - x1 for x1, y1, x2, y2 in word_boxes if x2 > x1]
-                median_word_w = float(np.median(ws)) if ws else 50.0
-                base = available_w / (median_word_w * 4.0)
-                state["base_zoom"] = max(0.5, min(5.0, base))
-                state["zoom_step"] = 0
+            # Compute base_zoom from actual word boxes every reflow.
+            # Raw word widths are used directly — reflow_words applies
+            # zoom_factor to those same widths, so no DPI conversion needed.
+            # zoom_step is NOT reset here — carries user's manual preference.
+            margin = max(10, int(20 / 2))
+            available_w = max(state["container_w"], 300) - 2 * margin
+            ws = [x2 - x1 for x1, y1, x2, y2 in word_boxes if x2 > x1]
+            median_word_w = float(np.median(ws)) if ws else 50.0
+            base = available_w / (median_word_w * 4.0)
+            state["base_zoom"] = max(0.1, base)
             zoom_factor = state["base_zoom"] * (ZOOM_INCREMENT ** state["zoom_step"])
-            btn_zoom.text = f"{zoom_factor:.2g}×"
+            txt_zoom.value = f"{zoom_factor:.2g}×"
             new_page_width = max(state["container_w"], 300)
 
-            reflow_img = await loop.run_in_executor(
-                None,
-                lambda: _do_reflow(dets, word_boxes, page_img, zoom_factor, new_page_width, state["lang"]),
-            )
-            state["reflow_image"] = reflow_img
-            state["show_reflow"] = True
-            btn_reflow.text = "Original"
-            btn_zoom.disabled = False
+            if mode == "server":
+                _lm = state.get("server_left_margin")
+                _rm = state.get("server_right_margin")
+                _srv_img = state.get("server_page_img") or page_img
+                reflow_img = await loop.run_in_executor(
+                    None,
+                    lambda: _do_reflow(dets, word_boxes, _srv_img, zoom_factor, new_page_width, state["lang"], _lm, _rm),
+                )
+            else:
+                reflow_img = await loop.run_in_executor(
+                    None,
+                    lambda: _do_reflow(dets, word_boxes, page_img, zoom_factor, new_page_width, state["lang"]),
+                )
+
+            state[image_key] = reflow_img
+            state["last_reflow_mode"] = mode
+            btn_zoom_out.disabled = False
+            btn_zoom_in.disabled = False
             set_status("Done.")
 
         except Exception as e:
             set_status(f"Reflow error: {e}\n{traceback.format_exc()}")
         finally:
             spinner.visible = False
-            btn_reflow.disabled = False
+            btn.disabled = False
             page.update()
 
         refresh_image()
 
-    async def cycle_zoom():
-        state["zoom_step"] += 1
+    async def do_zoom(delta: int):
+        state["zoom_step"] += delta
         zoom_factor = state["base_zoom"] * (ZOOM_INCREMENT ** state["zoom_step"])
-        btn_zoom.text = f"{zoom_factor:.2g}×"
-        btn_zoom.update()
-        # Invalidate reflow cache (dets and word_boxes are kept)
-        state["reflow_image"] = None
-        state["show_reflow"] = False
-        await run_reflow()
+        txt_zoom.value = f"{zoom_factor:.2g}×"
+        txt_zoom.update()
+        # Invalidate reflow image only — dets/word_boxes kept, no server call
+        mode = state["last_reflow_mode"]
+        if mode == "local":
+            state["local_reflow_image"] = None
+        elif mode == "server":
+            state["server_reflow_image"] = None
+        if mode is not None:
+            await run_reflow(mode)
 
     async def fix_skew():
         page_img = state.get("page_image")
-        dets = state.get("reflow_dets")
-        if page_img is None or dets is None:
+        if page_img is None:
             return
         btn_fix_skew.disabled = True
         btn_fix_skew.icon = ft.Icons.HOURGLASS_TOP
         btn_fix_skew.update()
         try:
-            img_bgr = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: cv2.cvtColor(np.array(page_img.convert("RGB")), cv2.COLOR_RGB2BGR),
-            )
-            angle = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: skew_detection.detect_skew_in_text_regions(img_bgr, dets),
-            )
-            if abs(angle) > 0.1:
-                corrected_bgr = await asyncio.get_event_loop().run_in_executor(
+            last_mode = state.get("last_reflow_mode")
+            if last_mode == "server":
+                # Use angle already returned by server
+                angle = state.get("skew_angle", 0.0)
+                if abs(angle) <= 0.1:
+                    set_status("No significant skew detected")
+                    return
+                img_bgr = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: skew_detection.rotate_image(img_bgr, angle),
+                    lambda: cv2.cvtColor(np.array(page_img.convert("RGB")), cv2.COLOR_RGB2BGR),
                 )
-                corrected_rgb = cv2.cvtColor(corrected_bgr, cv2.COLOR_BGR2RGB)
-                state["page_image"] = Image.fromarray(corrected_rgb)
-                # Invalidate all caches for this page so reflow uses corrected image
-                state["reflow_dets"] = None
-                state["reflow_word_boxes"] = None
-                state["reflow_image"] = None
-                state["show_reflow"] = False
-                set_status(f"Skew corrected ({angle:+.2f}°)")
             else:
-                set_status("No significant skew detected")
+                dets = state.get("local_dets")
+                if dets is None:
+                    set_status("Run reflow first to detect layout")
+                    return
+                img_bgr = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: cv2.cvtColor(np.array(page_img.convert("RGB")), cv2.COLOR_RGB2BGR),
+                )
+                angle = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: skew_detection.detect_skew_in_text_regions(img_bgr, dets),
+                )
+                if abs(angle) <= 0.1:
+                    set_status("No significant skew detected")
+                    return
+            corrected_bgr = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: skew_detection.rotate_image(img_bgr, angle),
+            )
+            corrected_rgb = cv2.cvtColor(corrected_bgr, cv2.COLOR_BGR2RGB)
+            state["page_image"] = Image.fromarray(corrected_rgb)
+            # Invalidate all caches for this page so reflow uses corrected image
+            state["local_dets"] = None
+            state["local_word_boxes"] = None
+            state["local_reflow_image"] = None
+            state["server_dets"] = None
+            state["server_word_boxes"] = None
+            state["server_reflow_image"] = None
+            state["server_left_margin"] = None
+            state["server_right_margin"] = None
+            state["server_page_img"] = None
+            state["last_reflow_mode"] = None
+            set_status(f"Skew corrected ({angle:+.2f}°)")
         except Exception as exc:
             set_status(f"Skew fix failed: {exc}")
         finally:
@@ -923,6 +1092,7 @@ async def main(page: ft.Page):
         state["doc_path"] = path
         state["doc_type"] = doc_type
         state["page_index"] = 0
+        state["zoom_step"] = 0   # reset zoom on new document
         set_status("Opening document…")
         await asyncio.sleep(0)
         try:
@@ -953,14 +1123,20 @@ async def main(page: ft.Page):
     # ---- layout ----
     # ---- normal UI layout ----
     normal_ui = ft.Column(
-        scroll=ft.ScrollMode.ALWAYS,
         expand=True,
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         controls=[
             ft.Row([btn_open, btn_prev, page_label, btn_next], spacing=8),
-            img_container,
+            scroll_wrapper,
             ft.Row(
-                [btn_reflow, btn_zoom, btn_fix_skew, dd_lang],
+                [btn_reflow_local, btn_reflow_server,
+                 btn_zoom_out, txt_zoom, btn_zoom_in,
+                 btn_fix_skew],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=8,
+            ),
+            ft.Row(
+                [dd_lang, tf_server_url],
                 alignment=ft.MainAxisAlignment.CENTER,
                 spacing=12,
             ),

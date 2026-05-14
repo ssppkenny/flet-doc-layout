@@ -440,6 +440,9 @@ def _split_word(
 
     cut_x = min(cut_x, word.xmax - 1)
     left  = Word(word.xmin, word.ymin, cut_x,     word.ymax, bl=word.bl, above=word.above)
+    # Reject splits where the left half is too narrow (noise pixel at boundary)
+    if (left.xmax - left.xmin) < max(10, int(word.width * 0.15)):
+        return None, word
     right = Word(cut_x,     word.ymin, word.xmax, word.ymax, bl=word.bl, above=word.above)
     return left, right
 
@@ -812,7 +815,8 @@ def create_page_word_reflow(
             if crop.size == 0:
                 continue
 
-            resized = cv2.resize(crop, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+            interp = cv2.INTER_AREA if zoom_factor < 1.0 else cv2.INTER_CUBIC
+            resized = cv2.resize(crop, (scaled_w, scaled_h), interpolation=interp)
 
             scaled_bl = int(w.bl * zoom_factor)
             word_above = int(w.height * zoom_factor) - scaled_bl
