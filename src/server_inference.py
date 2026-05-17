@@ -190,6 +190,103 @@ def analyze_page_bytes(
     return _parse_response(data)
 
 
+def ocr_page(
+    image_bytes: bytes,
+    filename: str = "page.jpg",
+    server_url: str = "http://localhost:8000",
+    no_pix2tex: bool = False,
+    cache_key: str = "",
+    timeout: int = 300,
+) -> str:
+    """
+    POST image bytes to /ocr_page and return the HTML string.
+
+    If cache_key is provided, the server stores the result under that key
+    so it can later be fetched via GET /ocr_result/{cache_key}.
+
+    Raises:
+        urllib.error.URLError  — network error or server unreachable
+        urllib.error.HTTPError — server returned 4xx/5xx
+    """
+    boundary = "----ServerInferenceBoundary"
+    ext = filename.rsplit(".", 1)[-1].lower()
+    content_type = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n"
+        f"\r\n"
+    ).encode() + image_bytes + f"\r\n--{boundary}--\r\n".encode()
+
+    params = urllib.parse.urlencode({
+        "no_pix2tex": "true" if no_pix2tex else "false",
+        "cache_key": cache_key,
+    })
+    endpoint = f"{server_url.rstrip('/')}/ocr_page?{params}"
+
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def ocr_page_stream(
+    image_bytes: bytes,
+    filename: str = "page.jpg",
+    server_url: str = "http://localhost:8000",
+    timeout: int = 30,
+) -> tuple[str, str]:
+    """POST image bytes to /ocr_page_stream and return (stream_url, token).
+
+    The server starts OCR in the background and returns immediately.
+    The caller should navigate a WebView to stream_url to see results
+    appear progressively.
+
+    Returns:
+        (stream_url, token) — stream_url is the full URL to load in WebView.
+
+    Raises:
+        urllib.error.URLError  — network error or server unreachable
+        urllib.error.HTTPError — server returned 4xx/5xx
+        ValueError             — response missing expected fields
+    """
+    boundary = "----ServerInferenceBoundary"
+    ext = filename.rsplit(".", 1)[-1].lower()
+    content_type = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n"
+        f"\r\n"
+    ).encode() + image_bytes + f"\r\n--{boundary}--\r\n".encode()
+
+    endpoint = f"{server_url.rstrip('/')}/ocr_page_stream"
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    stream_url = data.get("stream_url")
+    token = data.get("token")
+    if not stream_url or not token:
+        raise ValueError(f"Server response missing stream_url/token: {data}")
+    return stream_url, token
+
+
 def check_health(server_url: str = "http://localhost:8000", timeout: int = 5) -> bool:
     """Return True if the server is reachable and healthy."""
     try:

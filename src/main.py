@@ -67,6 +67,7 @@ def _settings_path() -> Path:
     return Path(__file__).parent / "assets" / "settings.json"
 
 
+
 def _load_settings() -> dict:
     p = _settings_path()
     if p.exists():
@@ -508,14 +509,39 @@ async def main(page: ft.Page):
         "lang": "en",               # user-selected ISO 639-1 code
         "pdf_lock": asyncio.Lock(), # serializes pypdfium2 access (not thread-safe)
         "doctr_lock": asyncio.Lock(), # serializes cv2.dnn inference (not thread-safe)
-        "server_url": "http://localhost:8000",  # remote server URL
+        "server_url": "http://192.168.1.121:8000",  # remote server URL
         "skew_angle": 0.0,          # last skew angle returned by server
+        "ocr_view": False,          # True = WebView showing OCR HTML
+        "ocr_font_step": 0,         # font size step in OCR view (reset on switch back)
     }
 
     # Load persisted settings
     _settings = _load_settings()
     if "server_url" in _settings:
         state["server_url"] = str(_settings["server_url"])
+
+    # ---- OCR ----
+    is_mobile = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS)
+
+    if is_mobile:
+        import flet_webview as fwv
+
+        async def _on_webview_url_change(e):
+            """Re-enable page navigation when OCR streaming is complete."""
+            if e.data and "ocr-done" in e.data:
+                btn_prev.disabled = state["page_index"] == 0
+                btn_next.disabled = state["page_index"] >= state["total_pages"] - 1
+                btn_prev.update()
+                btn_next.update()
+
+        webview_control = fwv.WebView(
+            expand=True,
+            visible=False,
+            on_web_resource_error=lambda e: set_status(f"WebView error: {e.data}"),
+            on_url_change=_on_webview_url_change,
+        )
+    else:
+        webview_control = None
 
     # ---- controls ----
     status_text = ft.Text("Loading models…", color=ft.Colors.GREY_400, size=13)
@@ -536,11 +562,21 @@ async def main(page: ft.Page):
         ),
     )
 
+    # Both img_container and webview_control are always in the tree (Stack).
+    # Visibility is toggled so _invoke_method works (control must be mounted).
+    _webview_or_placeholder = webview_control if webview_control is not None else ft.Container()
     scroll_wrapper = ft.Container(
-        content=ft.Column(
-            controls=[img_container],
-            scroll=ft.ScrollMode.ALWAYS,
-            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        content=ft.Stack(
+            controls=[
+                ft.Column(
+                    controls=[img_container],
+                    scroll=ft.ScrollMode.ALWAYS,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    expand=True,
+                ),
+                _webview_or_placeholder,
+            ],
+            expand=True,
         ),
         expand=True,
     )
@@ -580,6 +616,12 @@ async def main(page: ft.Page):
         tooltip="Fix skew",
         on_click=lambda _: asyncio.ensure_future(fix_skew()),
         disabled=True,
+    )
+    btn_ocr = ft.ElevatedButton(
+        "OCR",
+        icon=ft.Icons.DOCUMENT_SCANNER,
+        disabled=True,
+        on_click=lambda _: asyncio.ensure_future(run_ocr()),
     )
     dd_lang = ft.Dropdown(
         value="en",
@@ -723,6 +765,12 @@ async def main(page: ft.Page):
         state["skew_angle"] = 0.0
         state["last_reflow_mode"] = None
         state["base_zoom"] = None
+        state["ocr_view"] = False
+        # Restore image view if we were showing OCR
+        if is_mobile and webview_control is not None and webview_control.visible:
+            webview_control.visible = False
+            img_container.visible = True
+        btn_ocr.text = "OCR"
         # zoom_step intentionally NOT reset here — carries over across pages.
         # It is reset only when a new document is opened.
         btn_reflow_local.disabled = True
@@ -730,6 +778,7 @@ async def main(page: ft.Page):
         btn_zoom_out.disabled = True
         btn_zoom_in.disabled = True
         btn_fix_skew.disabled = True
+        btn_ocr.disabled = True
         page.update()
         set_status(f"Rendering page {index + 1}…")
         await asyncio.sleep(0)
@@ -754,6 +803,7 @@ async def main(page: ft.Page):
         btn_reflow_local.disabled = not models_ready
         btn_reflow_server.disabled = not bool(state["server_url"])
         btn_fix_skew.disabled = not (models_ready or bool(state["server_url"]))
+        btn_ocr.disabled = not bool(state["server_url"])
         page.update()
         refresh_image()
         set_status("Ready.")
@@ -988,6 +1038,15 @@ async def main(page: ft.Page):
         refresh_image()
 
     async def do_zoom(delta: int):
+        if state["ocr_view"] and webview_control is not None:
+            state["ocr_font_step"] += delta
+            size = max(0.5, round(1.0 + state["ocr_font_step"] * 0.1, 2))
+            txt_zoom.value = f"{size:.2g}×"
+            txt_zoom.update()
+            await webview_control.run_javascript(
+                f"document.documentElement.style.setProperty('--font-scale',{size})"
+            )
+            return
         state["zoom_step"] += delta
         zoom_factor = state["base_zoom"] * (ZOOM_INCREMENT ** state["zoom_step"])
         txt_zoom.value = f"{zoom_factor:.2g}×"
@@ -1061,6 +1120,107 @@ async def main(page: ft.Page):
             btn_fix_skew.icon = ft.Icons.STRAIGHTEN
             btn_fix_skew.update()
 
+    # ---- OCR helpers and run_ocr ----
+    async def _show_ocr_view(url: str):
+        """Switch to OCR WebView (mobile) or open browser (desktop)."""
+        state["ocr_view"] = True
+        if is_mobile and webview_control is not None:
+            img_container.visible = False
+            webview_control.visible = True
+            btn_zoom_out.disabled = False
+            btn_zoom_in.disabled = False
+            # Disable page navigation while OCR is streaming
+            btn_prev.disabled = True
+            btn_next.disabled = True
+            page.update()
+            try:
+                await webview_control.set_javascript_mode(fwv.JavaScriptMode.UNRESTRICTED)
+            except Exception as e:
+                set_status(f"JS mode error: {e}")
+            await webview_control.load_request(url)
+        else:
+            page.launch_url(url)
+
+    def _show_image_view():
+        """Switch back to image view."""
+        state["ocr_view"] = False
+        state["ocr_font_step"] = 0
+        if is_mobile and webview_control is not None:
+            webview_control.visible = False
+            webview_control.update()
+            img_container.visible = True
+            img_container.update()
+        # Re-evaluate button state: keep enabled only if a reflow image exists
+        has_reflow = (state.get("local_reflow_image") is not None
+                      or state.get("server_reflow_image") is not None)
+        btn_zoom_out.disabled = not has_reflow
+        btn_zoom_in.disabled = not has_reflow
+        btn_zoom_out.update()
+        btn_zoom_in.update()
+        # Re-enable page navigation (may have been disabled during streaming)
+        btn_prev.disabled = state["page_index"] == 0
+        btn_next.disabled = state["page_index"] >= state["total_pages"] - 1
+        btn_prev.update()
+        btn_next.update()
+
+    async def run_ocr():
+        if state["doc_path"] is None or state["page_image"] is None:
+            return
+
+        # Toggle: if already showing OCR, switch back to image
+        if state["ocr_view"]:
+            _show_image_view()
+            btn_ocr.text = "OCR"
+            btn_ocr.update()
+            return
+
+        # Run OCR on server
+        spinner.visible = True
+        btn_ocr.disabled = True
+        page.update()
+        set_status("Starting OCR…")
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            if state["doc_type"] == "pdf":
+                async with state["pdf_lock"]:
+                    ocr_img = await loop.run_in_executor(
+                        None,
+                        lambda: render_pdf_page(state["pdf_doc"], state["page_index"], dpi=300),
+                    )
+            else:
+                ocr_img = await loop.run_in_executor(
+                    None,
+                    lambda: render_djvu_page(state["doc_path"], state["page_index"], dpi=300),
+                )
+
+            img_bytes = io.BytesIO()
+            ocr_img.save(img_bytes, format="JPEG", quality=95)
+            img_bytes = img_bytes.getvalue()
+
+            # Upload image and get stream URL — returns quickly (<1s)
+            stream_url, _token = await loop.run_in_executor(
+                None,
+                lambda: server_inference.ocr_page_stream(
+                    image_bytes=img_bytes,
+                    filename="page.jpg",
+                    server_url=state["server_url"],
+                ),
+            )
+
+            # Show WebView immediately — OCR streams in progressively
+            await _show_ocr_view(stream_url)
+            btn_ocr.text = "Image"
+            set_status("OCR streaming…")
+        except Exception as exc:
+            set_status(f"OCR failed: {exc}")
+        finally:
+            spinner.visible = False
+            btn_ocr.disabled = False
+            btn_ocr.update()
+            page.update()
+
     # ---- file picker ----
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
@@ -1126,7 +1286,7 @@ async def main(page: ft.Page):
         expand=True,
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         controls=[
-            ft.Row([btn_open, btn_prev, page_label, btn_next], spacing=8),
+            ft.Row([btn_open, btn_prev, page_label, btn_next, btn_ocr], spacing=8),
             scroll_wrapper,
             ft.Row(
                 [btn_reflow_local, btn_reflow_server,
